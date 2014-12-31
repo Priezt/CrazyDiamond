@@ -1,0 +1,148 @@
+#!/usr/bin/env ruby
+
+$MAX_RETRY = 20
+
+def plugin(&block)
+	this_plugin = Plugin.new
+	this_plugin.instance_eval(&block)
+	$LAST_LOADED_PLUGIN = this_plugin
+end
+
+class AutoCorrectEngine
+	def initialize
+		load_plugins
+	end
+
+	def log(msg)
+		puts msg
+	end
+
+	def load_plugins
+		@plugins = []
+		plugin_dir = File.dirname(__FILE__) + "/plugin"
+		Dir[plugin_dir + "/*.rb"].each do |plugin_file|
+			@plugins << Plugin.load_plugin(plugin_file)
+		end
+	end
+
+	def work_with_output(output)
+		@output = output
+	end
+
+	def work_with_command_line(command_line)
+		@command_line = command_line
+		run_command_line
+		count = 0
+		while match_output_and_try_to_fix
+			count += 1
+			if count >= $MAX_RETRY
+				log "Reached max retry count: #{$MAX_RETRY}"
+				break
+			end
+			log "Fixed, now try to run again"
+			run_command_line
+		end
+	end
+
+	def match_output_and_try_to_fix
+		@plugins.each do |p|
+			if p.match_and_fix(@command_line || "", @output)
+				return true
+			end
+		end
+		log "Success or No recognized errors"
+		return false
+	end
+
+	def run_command_line
+		output = ""
+		IO.popen(@command_line + " 2>&1") do |f|
+			f.each_line do |line|
+				output += line
+				print line
+			end
+		end
+		@output = output
+	end
+end
+
+class Solution
+	def initialize(regex, &block)
+		@regex = regex
+		@solution_action = proc(&block)
+	end
+
+	def log(msg)
+		puts msg
+	end
+
+	def match(output)
+		if output =~ @regex
+			log "Solution matched"
+			return true
+		else
+			return false
+		end
+	end
+
+	def fix(command_line, output)
+		@command_line = command_line
+		@output = output
+		log "Try to fix"
+		@m = output.match(@regex)
+		instance_eval(&(@solution_action))
+	end
+end
+
+class Plugin
+	attr_accessor :name
+
+	def log(msg)
+		puts msg
+	end
+
+	def self.load_plugin(plugin_file)
+		load plugin_file
+		$LAST_LOADED_PLUGIN.name = plugin_file.sub(/.*\//, "").sub(/\..*/, "")
+		$LAST_LOADED_PLUGIN
+	end
+
+	def match_command_line(regex)
+		@command_line_regex = regex
+	end
+
+	def solution_for(regex, &block)
+		@solutions ||= []
+		@solutions << Solution.new(regex, &block)
+	end
+
+	def match_and_fix(command_line, output)
+		if command_line =~ @command_line_regex
+			log "Plugin matched: #{@name}"
+			@solutions.each do |solution|
+				if solution.match output
+					solution.fix command_line, output
+					return true
+				end
+			end
+			return false
+		else
+			return false
+		end
+	end
+end
+
+engine = AutoCorrectEngine.new
+
+if ARGV.length == 0
+	output = ""
+	STDIN.each_line do |line|
+		output += line
+		print line
+	end
+	engine.work_with_output output
+else
+	command_line = ARGV.join " "
+	engine.work_with_command_line command_line
+end
+
