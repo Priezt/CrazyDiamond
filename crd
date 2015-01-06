@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 
-$MAX_RETRY = 20
+require 'colorize'
+
+$MAX_COMMAND_COUNT = 500
 
 def plugin(&block)
 	this_plugin = Plugin.new
@@ -8,20 +10,29 @@ def plugin(&block)
 	$LAST_LOADED_PLUGIN = this_plugin
 end
 
-class AutoCorrectEngine
-	def initialize
-		load_plugins
-	end
-
+module Logger
 	def log(msg)
 		puts msg
 	end
+end
+
+class AutoCorrectEngine
+	attr_accessor :command_stack
+
+	def initialize
+		load_plugins
+		@command_stack = []
+	end
+
+	include Logger
 
 	def load_plugins
 		@plugins = []
 		plugin_dir = File.dirname(__FILE__) + "/plugin"
 		Dir[plugin_dir + "/*.rb"].each do |plugin_file|
-			@plugins << Plugin.load_plugin(plugin_file)
+			this_plugin = Plugin.load_plugin(plugin_file)
+			this_plugin.engine = self
+			@plugins << this_plugin
 		end
 	end
 
@@ -30,55 +41,58 @@ class AutoCorrectEngine
 	end
 
 	def work_with_command_line(command_line)
-		@command_line = command_line
-		run_command_line
+		@command_stack.push command_line
 		count = 0
-		while match_output_and_try_to_fix
+		while @command_stack.length > 0
 			count += 1
-			if count >= $MAX_RETRY
-				log "Reached max retry count: #{$MAX_RETRY}"
+			if count >= $MAX_COMMAND_COUNT
+				log "Reached max command count: #{$MAX_COMMAND_COUNT}"
 				break
 			end
-			log "Fixed, now try to run again"
-			run_command_line
+			current_command = @command_stack.last
+			output = run_command_line current_command
+			match_result = match_output_and_try_to_fix current_command, output
+			unless match_result
+				@command_stack.pop
+			end
 		end
 	end
 
-	def match_output_and_try_to_fix
+	def match_output_and_try_to_fix(command_line, output)
 		@plugins.each do |p|
-			if p.match_and_fix(@command_line || "", @output)
+			if p.match_and_fix(command_line || "", output)
 				return true
 			end
 		end
-		log "Success or No recognized errors"
+		log "[PASS] #{command_line}".green
 		return false
 	end
 
-	def run_command_line
+	def run_command_line(command_line)
+		log "[TRY] #{command_line}".yellow
 		output = ""
-		IO.popen(@command_line + " 2>&1") do |f|
+		IO.popen(command_line + " 2>&1") do |f|
 			f.each_line do |line|
 				output += line
 				print line
 			end
 		end
-		@output = output
+		output
 	end
 end
 
 class Solution
-	def initialize(regex, &block)
+	def initialize(this_plugin, regex, &block)
 		@regex = regex
 		@solution_action = proc(&block)
+		@plugin = this_plugin
 	end
 
-	def log(msg)
-		puts msg
-	end
+	include Logger
 
 	def match(output)
 		if output =~ @regex
-			log "Solution matched"
+			log "[ERROR] caught by plugin: #{@plugin.name}".red
 			return true
 		else
 			return false
@@ -88,18 +102,28 @@ class Solution
 	def fix(command_line, output)
 		@command_line = command_line
 		@output = output
-		log "Try to fix"
 		@m = output.match(@regex)
+		@commands_to_be_pushed = []
 		instance_eval(&(@solution_action))
+		@commands_to_be_pushed.reverse.each do |command|
+			push_command command
+		end
+	end
+
+	def run(command_line)
+		@commands_to_be_pushed.push command_line
+	end
+
+	def push_command(command_line)
+		@plugin.engine.command_stack.push command_line
 	end
 end
 
 class Plugin
 	attr_accessor :name
+	attr_accessor :engine
 
-	def log(msg)
-		puts msg
-	end
+	include Logger
 
 	def self.load_plugin(plugin_file)
 		load plugin_file
@@ -113,12 +137,11 @@ class Plugin
 
 	def solution_for(regex, &block)
 		@solutions ||= []
-		@solutions << Solution.new(regex, &block)
+		@solutions << Solution.new(self, regex, &block)
 	end
 
 	def match_and_fix(command_line, output)
 		if command_line =~ @command_line_regex
-			log "Plugin matched: #{@name}"
 			@solutions.each do |solution|
 				if solution.match output
 					solution.fix command_line, output
